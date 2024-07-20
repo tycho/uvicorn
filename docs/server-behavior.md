@@ -56,6 +56,12 @@ Applications should generally treat `HEAD` requests in the same manner as `GET` 
 
 One exception to this might be if your application serves large file downloads, in which case you might wish to only generate the response headers.
 
+### Zero copy send
+
+Uvicorn supports [ASGI Zero Copy Send Extension](https://asgi.readthedocs.io/en/latest/extensions.html#zero-copy-send). Using the method specified by the extension, you can call the zero-copy interface of the operating system to send files.
+
+Note: This is currently only available on Python3.7+. And it is temporarily unavailable with uvloop because [uvloop#228](https://github.com/MagicStack/uvloop/issues/228).
+
 ---
 
 ## Timeouts

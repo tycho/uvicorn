@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import http
 import logging
+import os
 from typing import Any, Callable, Literal, cast
 from urllib.parse import unquote
 
@@ -21,6 +22,7 @@ from uvicorn._types import (
 from uvicorn.config import Config
 from uvicorn.logging import TRACE_LOG_LEVEL
 from uvicorn.protocols.http.flow_control import CLOSE_HEADER, HIGH_WATER_LIMIT, FlowControl, service_unavailable
+from uvicorn.protocols.http.sendfile import can_sendfile
 from uvicorn.protocols.utils import get_client_addr, get_local_addr, get_path_with_query_string, get_remote_addr, is_ssl
 from uvicorn.server import ServerState
 
@@ -91,6 +93,7 @@ class H11Protocol(asyncio.Protocol):
         self.connections.add(self)
 
         self.transport = transport
+        self.allow_sendfile = can_sendfile(self.loop) and not is_ssl(self.transport)
         self.flow = FlowControl(transport)
         self.server = get_local_addr(transport)
         self.client = get_remote_addr(transport)
@@ -206,6 +209,9 @@ class H11Protocol(asyncio.Protocol):
                     "headers": self.headers,
                     "state": self.app_state.copy(),
                 }
+                if self.allow_sendfile:  # pragma: no cover
+                    extensions = self.scope.setdefault("extensions", {})
+                    extensions["http.response.zerocopysend"] = {}
 
                 upgrade = self._get_upgrade()
                 if upgrade == b"websocket" and self._should_upgrade_to_ws():
@@ -231,6 +237,8 @@ class H11Protocol(asyncio.Protocol):
                 self._unset_keepalive_if_required()
 
                 self.cycle = RequestResponseCycle(
+                    _loop=self.loop,
+                    allow_sendfile=self.allow_sendfile,
                     scope=self.scope,
                     conn=self.conn,
                     transport=self.transport,
@@ -355,6 +363,8 @@ class H11Protocol(asyncio.Protocol):
 class RequestResponseCycle:
     def __init__(
         self,
+        _loop: asyncio.AbstractEventLoop | None,
+        allow_sendfile: bool,
         scope: HTTPScope,
         conn: h11.Connection,
         transport: asyncio.Transport,
@@ -366,6 +376,8 @@ class RequestResponseCycle:
         message_event: asyncio.Event,
         on_response: Callable[..., None],
     ) -> None:
+        self.loop = _loop
+        self.allow_sendfile = allow_sendfile
         self.scope = scope
         self.conn = conn
         self.transport = transport
@@ -389,6 +401,11 @@ class RequestResponseCycle:
         # Response state
         self.response_started = False
         self.response_complete = False
+
+        # Sendfile
+        if self.allow_sendfile:  # pragma: no cover
+            # Set the buffer to 0 to avoid the problem of sending file before headers.
+            transport.set_write_buffer_limits(0)
 
     # ASGI exception wrapper
     async def run_asgi(self, app: ASGI3Application) -> None:
@@ -480,18 +497,55 @@ class RequestResponseCycle:
 
         elif not self.response_complete:
             # Sending response body
-            if message_type != "http.response.body":
-                msg = "Expected ASGI message 'http.response.body', but got '%s'."
-                raise RuntimeError(msg % message_type)
-            message = cast("HTTPResponseBodyEvent", message)
-
-            body = message.get("body", b"")
-            more_body = message.get("more_body", False)
+            use_sendfile = False
+            if message_type == "http.response.body":
+                body = cast(bytes,message.get("body", b""))
+                more_body = message.get("more_body", False)
+            elif (
+                self.allow_sendfile and message_type == "http.response.zerocopysend"
+            ):  # pragma: no cover
+                file_fd = message["file"]
+                sendfile_offset = message.get("offset", None)
+                if sendfile_offset is None:
+                    sendfile_offset = os.lseek(file_fd, 0, os.SEEK_CUR)
+                sendfile_count = message.get("count", None)
+                if sendfile_count is None:
+                    sendfile_count = os.stat(file_fd).st_size - sendfile_offset
+                more_body = message.get("more_body", False)
+                use_sendfile = True
+            else:
+                if self.allow_sendfile:  # pragma: no cover
+                    expect_message_types = (
+                        "http.response.body",
+                        "http.response.zerocopysend",
+                    )
+                else:
+                    expect_message_types = ("http.response.body",)
+                msg = "Expected ASGI message %s, but got '%s'."
+                raise RuntimeError(msg % expect_message_types, message_type)
 
             # Write response body
-            data = b"" if self.scope["method"] == "HEAD" else body
-            output = self.conn.send(event=h11.Data(data=data))
-            self.transport.write(output)
+            if self.scope["method"] == "HEAD":
+                event = h11.Data(data=b"")
+                output = self.conn.send(event)
+                self.transport.write(output)
+            elif use_sendfile:  # pragma: no cover
+                with os.fdopen(os.dup(file_fd), "rb") as file:
+                    event = SendfileData(file, sendfile_offset, sendfile_count)
+                    for data in self.conn.send_with_data_passthrough(
+                        h11.Data(data=event)
+                    ):
+                        if isinstance(data, SendfileData):
+                            await self.flow.drain()
+                            await self.loop.sendfile(
+                                self.transport, data.file, data.offset, data.count
+                            )
+                        else:
+                            self.transport.write(data)
+            else:
+                event = h11.Data(data=body)
+                output = self.conn.send(event)
+                self.transport.write(output)
 
             # Handle response completion
             if not more_body:
@@ -534,3 +588,13 @@ class RequestResponseCycle:
         }
         self.body = b""
         return message
+
+
+class SendfileData:
+    def __init__(self, file, offset, count):
+        self.file = file
+        self.offset = offset
+        self.count = count
+
+    def __len__(self):
+        return self.count

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import http
 import logging
+import os
 import re
 import urllib
 from asyncio.events import TimerHandle
@@ -22,6 +23,7 @@ from uvicorn._types import (
 from uvicorn.config import Config
 from uvicorn.logging import TRACE_LOG_LEVEL
 from uvicorn.protocols.http.flow_control import CLOSE_HEADER, HIGH_WATER_LIMIT, FlowControl, service_unavailable
+from uvicorn.protocols.http.sendfile import can_sendfile
 from uvicorn.protocols.utils import get_client_addr, get_local_addr, get_path_with_query_string, get_remote_addr, is_ssl
 from uvicorn.server import ServerState
 
@@ -93,6 +95,7 @@ class HttpToolsProtocol(asyncio.Protocol):
         self.connections.add(self)
 
         self.transport = transport
+        self.allow_sendfile = can_sendfile(self.loop) and not is_ssl(self.transport)
         self.flow = FlowControl(transport)
         self.server = get_local_addr(transport)
         self.client = get_remote_addr(transport)
@@ -221,6 +224,9 @@ class HttpToolsProtocol(asyncio.Protocol):
             "headers": self.headers,
             "state": self.app_state.copy(),
         }
+        if self.allow_sendfile:  # pragma: no cover
+            extensions = self.scope.setdefault("extensions", {})
+            extensions["http.response.zerocopysend"] = {}
 
     # Parser callbacks
     def on_url(self, url: bytes) -> None:
@@ -263,6 +269,8 @@ class HttpToolsProtocol(asyncio.Protocol):
 
         existing_cycle = self.cycle
         self.cycle = RequestResponseCycle(
+            _loop=self.loop,
+            allow_sendfile=self.allow_sendfile,
             scope=self.scope,
             transport=self.transport,
             flow=self.flow,
@@ -356,6 +364,8 @@ class HttpToolsProtocol(asyncio.Protocol):
 class RequestResponseCycle:
     def __init__(
         self,
+        _loop: asyncio.AbstractEventLoop,
+        allow_sendfile: bool,
         scope: HTTPScope,
         transport: asyncio.Transport,
         flow: FlowControl,
@@ -368,6 +378,8 @@ class RequestResponseCycle:
         keep_alive: bool,
         on_response: Callable[..., None],
     ):
+        self.loop = _loop
+        self.allow_sendfile = allow_sendfile
         self.scope = scope
         self.transport = transport
         self.flow = flow
@@ -392,6 +404,11 @@ class RequestResponseCycle:
         self.response_complete = False
         self.chunked_encoding: bool | None = None
         self.expected_content_length = 0
+
+        # Sendfile
+        if self.allow_sendfile:  # pragma: no cover
+            # Set the buffer to 0 to avoid the problem of sending file before headers.
+            transport.set_write_buffer_limits(0)
 
     # ASGI exception wrapper
     async def run_asgi(self, app: ASGI3Application) -> None:
@@ -502,31 +519,72 @@ class RequestResponseCycle:
 
         elif not self.response_complete:
             # Sending response body
-            if message_type != "http.response.body":
-                msg = "Expected ASGI message 'http.response.body', but got '%s'."
-                raise RuntimeError(msg % message_type)
-
-            body = cast(bytes, message.get("body", b""))
-            more_body = message.get("more_body", False)
+            use_sendfile = False
+            if message_type == "http.response.body":
+                body = cast(bytes, message.get("body", b""))
+                more_body = message.get("more_body", False)
+            elif (
+                self.allow_sendfile and message_type == "http.response.zerocopysend"
+            ):  # pragma: no cover
+                file_fd = message["file"]
+                sendfile_offset = message.get("offset", None)
+                if sendfile_offset is None:
+                    sendfile_offset = os.lseek(file_fd, 0, os.SEEK_CUR)
+                sendfile_count = message.get("count", None)
+                if sendfile_count is None:
+                    sendfile_count = os.stat(file_fd).st_size - sendfile_offset
+                more_body = message.get("more_body", False)
+                use_sendfile = True
+            else:
+                if self.allow_sendfile:  # pragma: no cover
+                    expect_message_types = (
+                        "http.response.body",
+                        "http.response.zerocopysend",
+                    )
+                else:
+                    expect_message_types = ("http.response.body",)
+                msg = "Expected ASGI message %s, but got '%s'."
+                raise RuntimeError(msg % expect_message_types, message_type)
 
             # Write response body
             if self.scope["method"] == "HEAD":
                 self.expected_content_length = 0
             elif self.chunked_encoding:
-                if body:
-                    content = [b"%x\r\n" % len(body), body, b"\r\n"]
-                else:
-                    content = []
-                if not more_body:
-                    content.append(b"0\r\n\r\n")
-                self.transport.write(b"".join(content))
+                if not use_sendfile:
+                    if body:
+                        content = [b"%x\r\n" % len(body), body, b"\r\n"]
+                    else:
+                        content = []
+                    if not more_body:
+                        content.append(b"0\r\n\r\n")
+                    self.transport.write(b"".join(content))
+                else:  # pragma: no cover
+                    self.transport.write(b"%x\r\n" % sendfile_count)
+                    await self.flow.drain()
+                    with os.fdopen(os.dup(file_fd), "rb") as file:
+                        await self.loop.sendfile(
+                            self.transport, file, sendfile_offset, sendfile_count
+                        )
+                    if more_body:
+                        self.transport.write(b"\r\n")
+                    else:
+                        self.transport.write(b"\r\n0\r\n\r\n")
             else:
-                num_bytes = len(body)
+                if not use_sendfile:
+                    num_bytes = len(body)
+                    self.transport.write(body)
+                else:  # pragma: no cover
+                    num_bytes = sendfile_count
+                    await self.flow.drain()
+                    with os.fdopen(os.dup(file_fd), "rb") as file:
+                        await self.loop.sendfile(
+                            self.transport, file, sendfile_offset, sendfile_count
+                        )
+
                 if num_bytes > self.expected_content_length:
                     raise RuntimeError("Response content longer than Content-Length")
                 else:
                     self.expected_content_length -= num_bytes
-                self.transport.write(body)
 
             # Handle response completion
             if not more_body:
