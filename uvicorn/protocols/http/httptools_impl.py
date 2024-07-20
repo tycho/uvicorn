@@ -561,10 +561,14 @@ class RequestResponseCycle:
                 else:  # pragma: no cover
                     self.transport.write(b"%x\r\n" % sendfile_count)
                     await self.flow.drain()
-                    with os.fdopen(os.dup(file_fd), "rb") as file:
-                        await self.loop.sendfile(
-                            self.transport, file, sendfile_offset, sendfile_count
-                        )
+                    try:
+                        with os.fdopen(os.dup(file_fd), "rb") as file:
+                            await self.loop.sendfile(
+                                self.transport, file, sendfile_offset, sendfile_count
+                            )
+                    except BrokenPipeError:
+                        self.transport.close()
+                        more_body = False
                     if more_body:
                         self.transport.write(b"\r\n")
                     else:
@@ -576,10 +580,14 @@ class RequestResponseCycle:
                 else:  # pragma: no cover
                     num_bytes = sendfile_count
                     await self.flow.drain()
-                    with os.fdopen(os.dup(file_fd), "rb") as file:
-                        await self.loop.sendfile(
-                            self.transport, file, sendfile_offset, sendfile_count
-                        )
+                    try:
+                        with os.fdopen(os.dup(file_fd), "rb") as file:
+                            await self.loop.sendfile(
+                                self.transport, file, sendfile_offset, sendfile_count
+                            )
+                    except BrokenPipeError:
+                        self.transport.close()
+                        more_body = False
 
                 if num_bytes > self.expected_content_length:
                     raise RuntimeError("Response content longer than Content-Length")

@@ -537,9 +537,14 @@ class RequestResponseCycle:
                     ):
                         if isinstance(data, SendfileData):
                             await self.flow.drain()
-                            await self.loop.sendfile(
-                                self.transport, data.file, data.offset, data.count
-                            )
+                            try:
+                                await self.loop.sendfile(
+                                    self.transport, data.file, data.offset, data.count
+                                )
+                            except BrokenPipeError:
+                                self.transport.close()
+                                more_body = False
+                                break
                         else:
                             self.transport.write(data)
             else:
